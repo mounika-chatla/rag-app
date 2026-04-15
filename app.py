@@ -1,19 +1,20 @@
 import streamlit as st
 import os
+import re
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Page config
+# 1. Page Configuration
 st.set_page_config(page_title="AI RAG App", layout="wide")
 
 st.title("📄 AI RAG Application")
 st.header("💬 Ask Questions from Your PDFs")
 
-# Session state
+# Initialize Session state
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
 
-# Load PDFs function
+# 2. PDF Loading & Processing
 def load_pdfs():
     documents = []
     data_path = "data"
@@ -22,62 +23,98 @@ def load_pdfs():
         st.error("❌ 'data' folder not found!")
         return []
 
-    for file in os.listdir(data_path):
-        if file.endswith(".pdf"):
-            file_path = os.path.join(data_path, file)
-            loader = PyPDFLoader(file_path)
-            documents.extend(loader.load())
+    pdf_files = [f for f in os.listdir(data_path) if f.endswith(".pdf")]
+    
+    for file in pdf_files:
+        loader = PyPDFLoader(os.path.join(data_path, file))
+        documents.extend(loader.load())
 
-    # Text splitting
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50
-    )
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    return splitter.split_documents(documents)
 
-    return text_splitter.split_documents(documents)
-
-# Load PDFs button
+# Load Button
 if st.button("Load PDFs"):
-    chunks = load_pdfs()
-    if chunks:
-        st.session_state.chunks = chunks
-        st.success(f"✅ {len(chunks)} chunks created from PDFs!")
-    else:
-        st.warning("⚠️ No PDFs found")
-
-# Question input
-user_question = st.text_input("Enter your question:")
-
-# Get Answer
-if st.button("Get Answer"):
-    if user_question:
-        if not st.session_state.chunks:
-            st.error("❌ Please load PDFs first!")
+    with st.spinner("Processing documents..."):
+        chunks = load_pdfs()
+        if chunks:
+            st.session_state.chunks = chunks
+            st.success(f"✅ Loaded {len(chunks)} chunks from your PDFs.")
         else:
-            results = []
+            st.warning("No PDF files found.")
 
-            # 🔥 SMART SEARCH (word-based)
-            query_words = user_question.lower().split()
+# 3. Search Input
+user_question = st.text_input("Enter your question:", placeholder="e.g., What is the average value?")
 
+# 4. Answer Logic
+if st.button("Get Answer"):
+    if not user_question:
+        st.warning("Please enter a question.")
+    elif not st.session_state.chunks:
+        st.error("Please load the PDFs first.")
+    else:
+        query = user_question.lower()
+        results = []
+
+        # --- 🔥 AGGREGATED: TOTAL & COUNT ---
+        if any(keyword in query for keyword in ["total purchase", "count", "how many"]):
+            unique_pos = set(os.path.basename(chunk.metadata['source']) for chunk in st.session_state.chunks)
+            st.success(f"📊 Total Purchase Orders: {len(unique_pos)}")
+            st.write("Documents: " + ", ".join(unique_pos))
+
+        # --- 🔥 AGGREGATED: AVERAGE VALUE ---
+        elif "average" in query:
+            all_values = []
+            # This pattern looks for currency amounts like 26,224.00 or 7,380.00
+            value_pattern = r"(?:Total|Cost|MRC|Amount).*?([\d,]+\.\d{2})"
+            
             for chunk in st.session_state.chunks:
-                content = chunk.page_content.lower()
+                matches = re.findall(value_pattern, chunk.page_content, re.IGNORECASE)
+                for m in matches:
+                    # Remove commas and convert to float
+                    clean_val = float(m.replace(",", ""))
+                    all_values.append(clean_val)
+            
+            if all_values:
+                # Use set to avoid counting the same value multiple times from different chunks
+                unique_values = list(set(all_values))
+                avg_val = sum(unique_values) / len(unique_values)
+                st.success(f"📊 Average Value: {avg_val:,.2f} INR")
+                st.write(f"Calculated from {len(unique_values)} unique values found.")
+            else:
+                st.warning("No numerical values found to calculate average.")
 
-                if any(word in content for word in query_words):
-                    results.append(chunk.page_content)
+        # --- 🔥 NON-AGGREGATED: SPECIFIC FACTS ---
+        else:
+            # GST Number
+            if "gst" in query:
+                pattern = r"GSTIN:?\s*([0-9A-Z]{15})"
+                for chunk in st.session_state.chunks:
+                    matches = re.findall(pattern, chunk.page_content)
+                    for m in matches:
+                        results.append(f"✅ GSTIN: **{m}** ({os.path.basename(chunk.metadata['source'])})")
 
-            st.subheader("📄 Answer:")
+            # PO Number
+            elif "number" in query:
+                pattern = r"(?:PO No|Ref\. No|Order No|Lr\. No):?\s*([A-Z0-9/\-\.]+)"
+                for chunk in st.session_state.chunks:
+                    matches = re.findall(pattern, chunk.page_content, re.IGNORECASE)
+                    for m in matches:
+                        results.append(f"🔢 PO Number: **{m}**")
+
+            # Supplier
+            elif any(keyword in query for keyword in ["supplier", "vendor", "who is"]):
+                for chunk in st.session_state.chunks:
+                    if "To" in chunk.page_content or "VENDOR" in chunk.page_content:
+                        lines = chunk.page_content.split("\n")
+                        for i, line in enumerate(lines):
+                            if "to" == line.strip().lower() or "vendor" in line.upper():
+                                if i + 1 < len(lines):
+                                    results.append(f"🏢 Supplier: **{lines[i+1].strip()}**")
+                                    break
 
             if results:
-                combined = " ".join(results[:3])
-
-                # 🔥 Aggregated question detection
-                if any(word in user_question.lower() for word in ["total", "count", "sum", "average"]):
-                    st.success(f"📊 Aggregated Result: Found {len(results)} relevant records in documents.")
-                else:
-                    # 🔥 Short clean answer
-                    short_answer = " ".join(combined.split("\n")[:3])
-                    st.write(short_answer)
+                st.subheader("Results found:")
+                for r in list(set(results)):
+                    st.write(r)
             else:
-                st.warning("No relevant data found.")
-    else:
-        st.warning("Please enter a question.")
+                st.warning("No specific answer found. Try 'GSTIN', 'Vendor', or 'Average'.")
